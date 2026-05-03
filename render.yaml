@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: lc79-md5-ai
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start

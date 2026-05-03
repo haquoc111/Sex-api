@@ -1,0 +1,13 @@
+{
+  "name": "lc79-md5-ai",
+  "version": "1.0.0",
+  "description": "AI du doan tai xiu",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "axios": "^1.6.8",
+    "express": "^4.19.2"
+  }
+}
