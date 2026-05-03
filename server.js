@@ -29,14 +29,16 @@ let CACHE = {
 
 let HISTORY = [];
 
+// Thống kê cho từng mô hình (tổng thể + 20 phiên gần)
 let PREDICTOR_STATS = {
-  markov:      { correct: 0, total: 0, recent10: { correct: 0, total: 0 } },
-  cau:         { correct: 0, total: 0, recent10: { correct: 0, total: 0 } },
-  dice:        { correct: 0, total: 0, recent10: { correct: 0, total: 0 } },
-  oscillation: { correct: 0, total: 0, recent10: { correct: 0, total: 0 } },
-  balance:     { correct: 0, total: 0, recent10: { correct: 0, total: 0 } }
+  markov:      { correct: 0, total: 0, recent20: { correct: 0, total: 0 } },
+  cau:         { correct: 0, total: 0, recent20: { correct: 0, total: 0 } },
+  dice:        { correct: 0, total: 0, recent20: { correct: 0, total: 0 } },
+  trend:       { correct: 0, total: 0, recent20: { correct: 0, total: 0 } },
+  balance:     { correct: 0, total: 0, recent20: { correct: 0, total: 0 } }
 };
 
+// Bộ nhớ bẻ cầu bệt
 let STREAK_BREAK_MEMORY = {};
 
 // ─────────────────────────────────────────────
@@ -56,311 +58,269 @@ const getStreak = (data) => {
 };
 
 // ─────────────────────────────────────────────
-//  1. DỰ ĐOÁN BẰNG MARKOV (bậc 3 khi đủ dữ liệu, nếu không thì bậc 2)
+//  1. MARKOV CÓ TRỌNG SỐ THỜI GIAN (EMA)
 // ─────────────────────────────────────────────
-function markovPredict(data, order = 3) {
+function markovPredict(data) {
   const arr = toArr(data);
-  // Yêu cầu ít nhất order+2 mẫu để có đủ chuyển tiếp
-  if (arr.length < order + 2) {
-    if (order > 1) return markovPredict(data, order - 1);
-    return { du_doan: null, confidence: 0 };
-  }
+  if (arr.length < 4) return { du_doan: null, confidence: 0 };
+
+  const order = arr.length >= 8 ? 3 : 2;
   const trans = {};
+  const decay = 0.9; // trọng số giảm dần cho các phiên cũ hơn
+
   for (let i = 0; i < arr.length - order; i++) {
     const state = arr.slice(i, i + order).join("");
     const next  = arr[i + order];
+    const weight = Math.pow(decay, i); // phiên càng cũ (i lớn) thì trọng số nhỏ
     if (!trans[state]) trans[state] = { T: 0, X: 0 };
-    trans[state][next]++;
+    trans[state][next] += weight;
   }
+
   const curState = arr.slice(0, order).join("");
   const counts   = trans[curState];
-  if (!counts || counts.T + counts.X < 3) {
-    if (order > 1) return markovPredict(data, order - 1);
-    return { du_doan: null, confidence: 0 };
+  if (!counts || counts.T + counts.X < 1) {
+    return markovPredict(data.slice(0, -1)); // fallback bậc thấp hơn nếu cần
   }
+
   const total = counts.T + counts.X;
-  const pT    = counts.T / total;
-  const pX    = counts.X / total;
+  const pT = counts.T / total;
+  const pX = counts.X / total;
   return {
-    du_doan:    pT >= pX ? "tài" : "xỉu",
-    confidence: Math.round(Math.max(pT, pX) * 100),
-    samples:    total
+    du_doan: pT >= pX ? "tài" : "xỉu",
+    confidence: Math.round(Math.max(pT, pX) * 90), // tối đa 90% vì không bao giờ chắc chắn
+    samples: total
   };
 }
 
 // ─────────────────────────────────────────────
-//  2. DỰ ĐOÁN DỰA TRÊN MẪU CẦU (nâng cấp)
+//  2. PHÂN TÍCH MẪU CẦU NÂNG CAO
 // ─────────────────────────────────────────────
 function patternPredict(data) {
-  if (data.length < 3) return { du_doan: null, confidence: 0, loai_cau: "chưa đủ" };
-  const arr    = toArr(data);
+  if (data.length < 5) return { du_doan: null, confidence: 0, loai_cau: "chưa đủ" };
+  const arr = toArr(data);
   const streak = getStreak(data);
-  const cur    = data[0].ket_qua;
-  const inv    = cur === "tài" ? "xỉu" : "tài";
 
-  // ── Cầu bệt (streak >= 3) ──
+  // Cầu bệt
   if (streak.count >= 3) {
     const key = streak.count;
     if (!STREAK_BREAK_MEMORY[key]) {
-      const defaultBreakProb = Math.min(0.9, 0.35 + (key - 3) * 0.07);
-      STREAK_BREAK_MEMORY[key] = { total: 0, broke: 0, defaultBreakProb };
+      STREAK_BREAK_MEMORY[key] = { total: 0, broke: 0, default: 0.4 + (key-3)*0.08 };
     }
-    const mem   = STREAK_BREAK_MEMORY[key];
-    let breakProb = mem.defaultBreakProb;
-    if (mem.total >= 4) {
-      breakProb = mem.broke / mem.total;
+    const mem = STREAK_BREAK_MEMORY[key];
+    let breakProb = mem.total >= 3 ? mem.broke / mem.total : mem.default;
+    breakProb = Math.max(0.2, Math.min(0.9, breakProb));
+
+    if (breakProb >= 0.55) {
+      return {
+        du_doan: streak.side === "tài" ? "xỉu" : "tài",
+        confidence: Math.round(breakProb * 100),
+        loai_cau: `bệt ${streak.side}`,
+        hanh_dong: "BẺ"
+      };
+    } else {
+      return {
+        du_doan: streak.side,
+        confidence: Math.round((1 - breakProb) * 100),
+        loai_cau: `bệt ${streak.side}`,
+        hanh_dong: "THEO"
+      };
     }
-    const theo = streak.side;
-    const be   = theo === "tài" ? "xỉu" : "tài";
-    if (breakProb >= 0.50) {
-      return { du_doan: be, confidence: Math.round(breakProb * 100), loai_cau: `bệt ${theo}`,
-               hanh_dong: "BẺ", reason: `bệt ${key} phiên, tỉ lệ gãy ${mem.total>=4?Math.round(breakProb*100):'~'+Math.round(breakProb*100)}%` };
-    }
-    return { du_doan: theo, confidence: Math.round((1 - breakProb) * 100), loai_cau: `bệt ${theo}`,
-             hanh_dong: "THEO", reason: `bệt ${key} phiên, khả năng tiếp tục cao` };
   }
 
-  // ── Cầu 1-1 ──
-  let alt = true;
-  const check = Math.min(6, arr.length - 1);
-  for (let i = 1; i <= check; i++) if (arr[i] === arr[i-1]) { alt = false; break; }
-  if (alt && arr.length >= 4) {
-    return { du_doan: inv, confidence: 72, loai_cau: "1-1", hanh_dong: "THEO",
-             reason: "cầu 1-1 rõ" };
-  }
-
-  // ── Cầu 2-2 ──
-  if (arr.length >= 4) {
-    let pairs = 0, i = 0;
-    const expect = arr[0];
-    while (i+1 < arr.length) {
-      if (arr[i] === arr[i+1] && arr[i] === (pairs%2===0?expect:(expect==='T'?'X':'T'))) {
-        pairs++; i+=2;
+  // Các mẫu cầu khác (1-1, 2-2, 3-3, 4-4) kiểm tra chính xác hơn
+  const detectPattern = (arr, blockSize) => {
+    if (arr.length < blockSize * 2) return null;
+    let blocks = [];
+    let i = 0;
+    while (i + blockSize <= arr.length) {
+      const block = arr.slice(i, i + blockSize);
+      if (block.every(v => v === block[0])) {
+        blocks.push(block[0]);
+        i += blockSize;
       } else break;
     }
-    if (pairs >= 2) {
-      const nextSide = pairs % 2 === 0 ? expect : (expect === 'T' ? 'X' : 'T');
-      return { du_doan: nextSide, confidence: 75, loai_cau: "2-2", hanh_dong: "THEO" };
+    if (blocks.length < 2) return null;
+    // Kiểm tra luân phiên
+    for (let j = 1; j < blocks.length; j++) {
+      if (blocks[j] === blocks[j-1]) return null; // không luân phiên
     }
+    // Dự đoán block tiếp theo
+    const nextSide = blocks[blocks.length - 1] === 'T' ? 'X' : 'T';
+    return { du_doan: nextSide === 'T' ? 'tài' : 'xỉu', confidence: 80, loai_cau: `${blockSize}-${blockSize}` };
+  };
+
+  // Kiểm tra từ block size lớn đến nhỏ để ưu tiên mẫu mạnh hơn
+  for (let size of [4, 3, 2]) {
+    const p = detectPattern(arr, size);
+    if (p) return { ...p, hanh_dong: "THEO" };
   }
 
-  // ── Cầu 3-3 ──
-  if (arr.length >= 6) {
-    let blocks = 0, i = 0;
-    let exp = arr[0];
-    while (i+3 <= arr.length) {
-      if (arr[i]===exp && arr[i+1]===exp && arr[i+2]===exp) {
-        blocks++;
-        exp = exp === 'T' ? 'X' : 'T';
-        i += 3;
-      } else break;
-    }
-    if (blocks >= 2) {
-      const nextSide = blocks % 2 === 0 ? exp : (exp === 'T' ? 'X' : 'T');
-      return { du_doan: nextSide, confidence: 78, loai_cau: "3-3", hanh_dong: "THEO" };
-    }
+  // Cầu 1-1
+  let is11 = true;
+  for (let i = 1; i < Math.min(6, arr.length); i++) {
+    if (arr[i] === arr[i-1]) { is11 = false; break; }
+  }
+  if (is11 && arr.length >= 4) {
+    const next = arr[0] === 'T' ? 'xỉu' : 'tài';
+    return { du_doan: next, confidence: 75, loai_cau: "1-1", hanh_dong: "THEO" };
   }
 
-  // ── Cầu 4-4 (mới thêm) ──
-  if (arr.length >= 8) {
-    let blocks = 0, i = 0;
-    let exp = arr[0];
-    while (i+4 <= arr.length) {
-      if (arr[i]===exp && arr[i+1]===exp && arr[i+2]===exp && arr[i+3]===exp) {
-        blocks++;
-        exp = exp === 'T' ? 'X' : 'T';
-        i += 4;
-      } else break;
-    }
-    if (blocks >= 2) {
-      const nextSide = blocks % 2 === 0 ? exp : (exp === 'T' ? 'X' : 'T');
-      return { du_doan: nextSide, confidence: 80, loai_cau: "4-4", hanh_dong: "THEO" };
-    }
-  }
-
-  // ── Nghiêng >70% trong 10 phiên ──
+  // Nghiêng 10 phiên
   const s10 = data.slice(0,10);
-  const tCnt = s10.filter(i=>i.ket_qua==='tài').length;
-  const xCnt = s10.length - tCnt;
-  if (tCnt >= 7 || xCnt >= 7) {
-    const dom = tCnt >= 7 ? 'tài' : 'xỉu';
-    const brk = dom === 'tài' ? 'xỉu' : 'tài';
-    return { du_doan: brk, confidence: 62, loai_cau: `nghiêng ${dom}`, hanh_dong: "BẺ" };
-  }
+  const t10 = s10.filter(i=>i.ket_qua==='tài').length;
+  if (t10 >= 7) return { du_doan: 'xỉu', confidence: 65, loai_cau: 'nghiêng tài', hanh_dong: 'BẺ' };
+  if (t10 <= 3) return { du_doan: 'tài', confidence: 65, loai_cau: 'nghiêng xỉu', hanh_dong: 'BẺ' };
 
   return { du_doan: null, confidence: 0, loai_cau: "không rõ" };
 }
 
 // ─────────────────────────────────────────────
-//  3. DỰ ĐOÁN THEO TỔNG ĐIỂM (sử dụng độ lệch chuẩn và trung bình)
+//  3. DỰ ĐOÁN THEO TỔNG ĐIỂM (cải tiến)
 // ─────────────────────────────────────────────
 function dicePredict(data) {
-  if (data.length < 10) return { du_doan: null, confidence: 0 };
-  const totals = data.slice(0, 10).map(i => i.total);
+  if (data.length < 8) return { du_doan: null, confidence: 0 };
+  const totals = data.slice(0, 8).map(i => i.total);
   const avg = totals.reduce((a,b)=>a+b,0)/totals.length;
-  const variance = totals.reduce((s, t) => s + (t - avg) ** 2, 0) / totals.length;
-  const std = Math.sqrt(variance);
 
-  // Nếu trung bình cao và độ lệch chuẩn thấp -> xu hướng tài rõ rệt, dự đoán xỉu (hồi quy)
-  if (avg > 11.5 && std < 2.5) return { du_doan: "xỉu", confidence: 70 };
-  if (avg < 9.5  && std < 2.5) return { du_doan: "tài", confidence: 70 };
-  // Trung bình hơi cao/thấp với độ lệch chuẩn trung bình
-  if (avg > 11.0) return { du_doan: "xỉu", confidence: 60 };
-  if (avg < 10.0) return { du_doan: "tài", confidence: 60 };
+  // Trung bình tổng điểm 3 xúc xắc là 10.5. Càng xa thì khả năng đảo chiều cao.
+  if (avg > 11.8) return { du_doan: "xỉu", confidence: 72 };
+  if (avg < 9.2)  return { du_doan: "tài", confidence: 72 };
+  if (avg > 11.2) return { du_doan: "xỉu", confidence: 62 };
+  if (avg < 9.8)  return { du_doan: "tài", confidence: 62 };
   return { du_doan: null, confidence: 0 };
 }
 
 // ─────────────────────────────────────────────
-//  4. DỰ ĐOÁN DAO ĐỘNG (oscillation) - mở rộng nhận diện các mẫu đảo chiều
+//  4. DỰ ĐOÁN THEO XU HƯỚNG TỔNG ĐIỂM (TREND)
 // ─────────────────────────────────────────────
-function oscillationPredict(data) {
-  if (data.length < 5) return { du_doan: null, confidence: 0 };
-  const arr = data.slice(0,5).map(i=>i.ket_qua);
-  // Kiểm tra mẫu T X T X T => tiếp tục X
-  if (arr[0]===arr[2] && arr[2]===arr[4] && arr[1]===arr[3] && arr[0]!==arr[1]) {
-    return { du_doan: arr[1], confidence: 70 }; // dự đoán tiếp tục đảo
-  }
-  if (arr[0]===arr[2] && arr[1]===arr[3] && arr[0]!==arr[1]) {
-    return { du_doan: arr[0], confidence: 65 }; // mẫu 2-1
-  }
-  // Nếu 5 phiên gần nhất có 3 T và 2 X, kiểm tra xem có luân phiên không
-  const last4 = data.slice(0,4).map(i=>i.ket_qua);
-  if (last4[0]===last4[2] && last4[1]===last4[3] && last4[0]!==last4[1]) {
-    return { du_doan: last4[0], confidence: 65 };
-  }
+function trendPredict(data) {
+  if (data.length < 6) return { du_doan: null, confidence: 0 };
+  const totals = data.slice(0, 6).map(i => i.total);
+  // Hồi quy tuyến tính đơn giản
+  const n = totals.length;
+  const indices = Array.from({length: n}, (_, i) => i);
+  const xMean = (n-1)/2;
+  const yMean = totals.reduce((a,b)=>a+b,0)/n;
+  const num = indices.reduce((s, x, i) => s + (x - xMean)*(totals[i] - yMean), 0);
+  const den = indices.reduce((s, x) => s + (x - xMean)**2, 0);
+  if (den === 0) return { du_doan: null, confidence: 0 };
+  const slope = num / den;
+
+  if (slope > 0.5) return { du_doan: "tài", confidence: 65 };
+  if (slope < -0.5) return { du_doan: "xỉu", confidence: 65 };
+  // Nếu slope gần 0 -> sideway, theo tổng trung bình
+  if (yMean > 10.5) return { du_doan: "tài", confidence: 55 };
+  if (yMean < 10.5) return { du_doan: "xỉu", confidence: 55 };
   return { du_doan: null, confidence: 0 };
 }
 
 // ─────────────────────────────────────────────
-//  5. DỰ ĐOÁN CÂN BẰNG DÀI HẠN (balance) - mean reversion 30-50 phiên
+//  5. CÂN BẰNG DÀI HẠN (30 phiên)
 // ─────────────────────────────────────────────
 function balancePredict(data) {
   if (data.length < 30) return { du_doan: null, confidence: 0 };
   const sample = data.slice(0, 30);
   const tCount = sample.filter(i => i.ket_qua === 'tài').length;
-  const ratio  = tCount / sample.length;
-  if (ratio > 0.6) return { du_doan: "xỉu", confidence: Math.round((ratio - 0.5) * 200) }; // confidence 20-40
+  const ratio = tCount / 30;
+  if (ratio > 0.6) return { du_doan: "xỉu", confidence: Math.round((ratio - 0.5) * 200) };
   if (ratio < 0.4) return { du_doan: "tài", confidence: Math.round((0.5 - ratio) * 200) };
   return { du_doan: null, confidence: 0 };
 }
 
 // ─────────────────────────────────────────────
-//  TÍNH TRỌNG SỐ ĐỘNG (có xét phong độ 10 phiên gần nhất)
+//  CHỌN MÔ HÌNH TỐT NHẤT TRONG 20 PHIÊN GẦN
 // ─────────────────────────────────────────────
-function getPredictorWeights() {
+function getBestModels() {
   const stats = PREDICTOR_STATS;
-  const defaultWeight = {
-    markov: 0.25, cau: 0.35, dice: 0.15, oscillation: 0.15, balance: 0.10
-  };
+  const models = ['markov', 'cau', 'dice', 'trend', 'balance']
+    .map(key => ({
+      name: key,
+      recentAccuracy: stats[key].recent20.total >= 5
+        ? stats[key].recent20.correct / stats[key].recent20.total
+        : 0.5, // mặc định nếu chưa đủ dữ liệu
+      overall: stats[key].total > 0 ? stats[key].correct / stats[key].total : 0.5
+    }))
+    .sort((a, b) => b.recentAccuracy - a.recentAccuracy);
 
-  const calcWeight = (stat) => {
-    if (stat.total < 5) return null;
-    const overall = stat.correct / stat.total;
-    // Nếu recent10 có ít nhất 3 mẫu thì kết hợp 70% overall + 30% recent
-    if (stat.recent10 && stat.recent10.total >= 3) {
-      const recent = stat.recent10.correct / stat.recent10.total;
-      return overall * 0.7 + recent * 0.3;
-    }
-    return overall;
-  };
-
-  const weights = {};
-  for (let k of ['markov', 'cau', 'dice', 'oscillation', 'balance']) {
-    const w = calcWeight(stats[k]);
-    weights[k] = w !== null ? w : defaultWeight[k];
-  }
-
-  // Chuẩn hóa
-  const total = Object.values(weights).reduce((a,b)=>a+b,0);
-  for (let k in weights) weights[k] /= total;
-
-  return weights;
+  return models.slice(0, 2); // lấy 2 mô hình tốt nhất gần đây
 }
 
 // ─────────────────────────────────────────────
-//  ENSEMBLE NÂNG CAO (có cơ chế đồng thuận và ngưỡng confidence)
+//  ENSEMBLE THÔNG MINH (chỉ dùng top 2 models + cơ chế đồng thuận)
 // ─────────────────────────────────────────────
 function finalPredict(data) {
   const mk = markovPredict(data);
   const pt = patternPredict(data);
   const dc = dicePredict(data);
-  const os = oscillationPredict(data);
+  const tr = trendPredict(data);
   const bl = balancePredict(data);
 
-  const preds = [
-    { source: "markov",       ...mk, conf: mk.confidence / 100 },
-    { source: "cau",          ...pt, conf: pt.confidence / 100 },
-    { source: "dice",         ...dc, conf: dc.confidence / 100 },
-    { source: "oscillation",  ...os, conf: os.confidence / 100 },
-    { source: "balance",      ...bl, conf: bl.confidence / 100 }
-  ];
+  const predictions = { markov: mk, cau: pt, dice: dc, trend: tr, balance: bl };
 
-  const weights = getPredictorWeights();
+  const bestModels = getBestModels();
+  let weightedTai = 0, weightedXiu = 0;
+  let totalWeight = 0;
 
-  let weightedTai = 0, weightedXiu = 0, totalWeight = 0;
-  let consensusTai = 0, consensusXiu = 0, consensusCount = 0;
-  for (let p of preds) {
-    if (!p.du_doan) continue;
-    const w = weights[p.source] * (p.conf || 0.5);
-    if (p.du_doan === "tài") {
-      weightedTai += w;
-      consensusTai++;
-    } else if (p.du_doan === "xỉu") {
-      weightedXiu += w;
-      consensusXiu++;
+  for (let model of bestModels) {
+    const pred = predictions[model.name];
+    if (!pred || !pred.du_doan) continue;
+    const weight = model.recentAccuracy; // trọng số là độ chính xác gần đây
+    if (pred.du_doan === "tài") weightedTai += weight;
+    else weightedXiu += weight;
+    totalWeight += weight;
+  }
+
+  // Nếu top 2 không đủ, mở rộng ra cả 5
+  if (totalWeight === 0) {
+    for (let key in predictions) {
+      const p = predictions[key];
+      if (!p || !p.du_doan) continue;
+      const w = 0.6; // trọng số mặc định
+      if (p.du_doan === "tài") weightedTai += w;
+      else weightedXiu += w;
+      totalWeight += w;
     }
-    consensusCount++;
-    totalWeight += w;
   }
 
-  if (totalWeight === 0 || consensusCount === 0) {
-    // fallback dựa trên 5 phiên gần nhất
-    const s5 = data.slice(0,5).filter(i=>i.ket_qua==='tài').length;
-    return { du_doan: s5>=3?'tài':'xỉu', do_tin_cay: 51, loai_cau: 'không rõ', hanh_dong: '-' };
+  if (totalWeight === 0) {
+    const s3 = data.slice(0,3).filter(i=>i.ket_qua==='tài').length;
+    return { du_doan: s3>=2?'tài':'xỉu', do_tin_cay: 51, loai_cau: 'fallback', hanh_dong: '-' };
   }
 
-  let finalSide, confidence;
-  if (consensusCount >= 4 && (consensusTai >= 4 || consensusXiu >= 4)) {
-    // Đồng thuận cao
-    finalSide = consensusTai >= 4 ? "tài" : "xỉu";
-    confidence = 85; // rất tự tin
-  } else {
-    const pTai = weightedTai / totalWeight;
-    const pXiu = weightedXiu / totalWeight;
-    finalSide = pTai >= pXiu ? "tài" : "xỉu";
-    confidence = Math.round(Math.max(pTai, pXiu) * 100);
-  }
+  const finalSide = weightedTai >= weightedXiu ? "tài" : "xỉu";
+  const confidence = Math.min(95, Math.round(Math.max(weightedTai, weightedXiu) / totalWeight * 100));
 
-  // Lấy loại cầu và hành động từ pattern nếu có
-  let loai_cau = pt.loai_cau || "tổng hợp";
-  let hanh_dong = pt.hanh_dong || (finalSide === data[0].ket_qua ? "THEO" : "BẺ");
-  let canh_bao = `🎯 ${loai_cau} | ${finalSide} (độ tin cậy ${confidence}%)`;
+  // Lấy thông tin cầu từ pattern (nếu có)
+  const loai_cau = pt.loai_cau || (weightedTai > weightedXiu ? "thiên tài" : "thiên xỉu");
+  const hanh_dong = pt.hanh_dong || (finalSide === data[0].ket_qua ? "THEO" : "BẺ");
 
   return {
-    du_doan: finalSide, do_tin_cay: confidence, loai_cau, hanh_dong, canh_bao,
-    thuat_toan: { markov: mk, cau: pt, dice: dc, oscillation: os, balance: bl, weights }
+    du_doan: finalSide,
+    do_tin_cay: confidence,
+    loai_cau,
+    hanh_dong,
+    canh_bao: `🎯 ${loai_cau} | ${finalSide} (${confidence}%)`,
+    thuat_toan: { markov: mk, cau: pt, dice: dc, trend: tr, balance: bl, bestModels }
   };
 }
 
 // ─────────────────────────────────────────────
-//  CẬP NHẬT THỐNG KÊ SAU MỖI PHIÊN (bao gồm recent10)
+//  CẬP NHẬT THỐNG KÊ
 // ─────────────────────────────────────────────
 function updatePredictorStats() {
   const checked = HISTORY.filter(h => h.checked);
-  // Reset toàn bộ thống kê
+  const recent20 = checked.slice(-20);
+
+  const reset = () => ({ correct: 0, total: 0, recent20: { correct: 0, total: 0 } });
+
   PREDICTOR_STATS = {
-    markov:      { correct: 0, total: 0, recent10: { correct: 0, total: 0 } },
-    cau:         { correct: 0, total: 0, recent10: { correct: 0, total: 0 } },
-    dice:        { correct: 0, total: 0, recent10: { correct: 0, total: 0 } },
-    oscillation: { correct: 0, total: 0, recent10: { correct: 0, total: 0 } },
-    balance:     { correct: 0, total: 0, recent10: { correct: 0, total: 0 } }
+    markov: reset(), cau: reset(), dice: reset(), trend: reset(), balance: reset()
   };
 
-  // Duyệt toàn bộ lịch sử đã xác minh để tính overall
   for (let h of checked) {
     const actual = h.thuc_te;
     if (h.predicted) {
-      for (let key of ['markov', 'cau', 'dice', 'oscillation', 'balance']) {
+      for (let key of Object.keys(PREDICTOR_STATS)) {
         if (h.predicted[key] && h.predicted[key].du_doan) {
           PREDICTOR_STATS[key].total++;
           if (h.predicted[key].du_doan === actual) PREDICTOR_STATS[key].correct++;
@@ -369,34 +329,28 @@ function updatePredictorStats() {
     }
   }
 
-  // Tính recent10 (10 phiên gần nhất)
-  const recent10 = checked.slice(-10);
-  for (let h of recent10) {
+  for (let h of recent20) {
     const actual = h.thuc_te;
     if (h.predicted) {
-      for (let key of ['markov', 'cau', 'dice', 'oscillation', 'balance']) {
+      for (let key of Object.keys(PREDICTOR_STATS)) {
         if (h.predicted[key] && h.predicted[key].du_doan) {
-          PREDICTOR_STATS[key].recent10.total++;
-          if (h.predicted[key].du_doan === actual) PREDICTOR_STATS[key].recent10.correct++;
+          PREDICTOR_STATS[key].recent20.total++;
+          if (h.predicted[key].du_doan === actual) PREDICTOR_STATS[key].recent20.correct++;
         }
       }
     }
   }
 
-  // Cập nhật học bệt
+  // Cập nhật bộ nhớ bệt
   const arr = HISTORY.filter(h=>h.checked).map(h=>({ket_qua: h.thuc_te}));
   if (arr.length >= 3) {
     const streak = getStreak(arr);
     if (streak.count >= 3) {
       const key = streak.count;
-      if (!STREAK_BREAK_MEMORY[key]) STREAK_BREAK_MEMORY[key] = { total: 0, broke: 0, defaultBreakProb: 0.5 };
+      if (!STREAK_BREAK_MEMORY[key]) STREAK_BREAK_MEMORY[key] = { total: 0, broke: 0, default: 0.5 };
       STREAK_BREAK_MEMORY[key].total++;
       if (arr.length > streak.count && arr[streak.count].ket_qua !== streak.side) {
         STREAK_BREAK_MEMORY[key].broke++;
-      }
-      if (STREAK_BREAK_MEMORY[key].total > 20) {
-        STREAK_BREAK_MEMORY[key].total *= 0.8;
-        STREAK_BREAK_MEMORY[key].broke *= 0.8;
       }
     }
   }
@@ -412,7 +366,7 @@ function verifyHistory(parsed) {
     if (real !== undefined) {
       h.checked = true;
       h.thuc_te = real;
-      h.dung    = h.du_doan === real;
+      h.dung = h.du_doan === real;
     }
   }
   if (HISTORY.length > 150) HISTORY = HISTORY.slice(-150);
@@ -452,7 +406,6 @@ async function updateData() {
     });
 
     verifyHistory(parsed);
-
     const prediction = finalPredict(parsed);
     const latestPhien = parsed[0].phien;
 
@@ -517,14 +470,13 @@ app.get("/algorithms", (req, res) => {
   res.json({
     status: "success",
     predictors: {
-      markov: "Chuỗi Markov bậc 3 (fallback bậc 2)",
-      cau: "Phân tích mẫu cầu nâng cao (1-1,2-2,3-3,4-4,bệt) + học xác suất bẻ cầu",
-      dice: "Hồi quy trung bình & độ lệch chuẩn tổng điểm 10 phiên",
-      oscillation: "Phát hiện dao động 1-1, 2-2 mở rộng",
-      balance: "Cân bằng dài hạn (30 phiên), mean reversion",
-      ensemble: "Bỏ phiếu có trọng số động dựa trên phong độ tổng thể & 10 phiên gần nhất, ưu tiên đồng thuận cao"
+      markov: "Markov EMA bậc 2/3",
+      cau: "Phân tích mẫu cầu (1-1..4-4, bệt, nghiêng)",
+      dice: "Hồi quy trung bình tổng điểm",
+      trend: "Xu hướng tổng điểm (hồi quy tuyến tính)",
+      balance: "Cân bằng dài hạn 30 phiên"
     },
-    weights: getPredictorWeights(),
+    best_models: getBestModels().map(m => m.name),
     streak_memory: STREAK_BREAK_MEMORY
   });
 });
@@ -549,9 +501,9 @@ updateData();
 setInterval(updateData, 5000);
 
 app.listen(PORT, () => {
-  console.log(`\n🎲 Tài Xỉu Adaptive Server — cổng ${PORT}`);
+  console.log(`\n🎲 Tài Xỉu Pro Server — cổng ${PORT}`);
   console.log("  /            → trạng thái hiện tại");
   console.log("  /predict     → dự đoán");
-  console.log("  /algorithms  → xem trọng số & bộ nhớ");
+  console.log("  /algorithms  → xem top model & trọng số");
   console.log("  /accuracy    → lịch sử & thống kê\n`);
 });
