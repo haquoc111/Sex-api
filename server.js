@@ -29,20 +29,19 @@ let CACHE = {
 
 let HISTORY = [];
 
-// Thêm cờ trạng thái thị trường
-let MARKET_STATE = { trend: null, duration: 0 }; // 'tài', 'xỉu', hoặc null
+let MARKET_STATE = { trend: null, duration: 0 };
 
 let PREDICTOR_STATS = {
   markov:      { correct: 0, total: 0, recent20: { correct: 0, total: 0 } },
   cau:         { correct: 0, total: 0, recent20: { correct: 0, total: 0 } },
   dice:        { correct: 0, total: 0, recent20: { correct: 0, total: 0 } },
   trend:       { correct: 0, total: 0, recent20: { correct: 0, total: 0 } },
-  balance:     { correct: 0, total: 0, recent20: { correct: 0, total: 0 } }
+  balance:     { correct: 0, total: 0, recent20: { correct: 0, total: 0 } },
+  market_trend:{ correct: 0, total: 0, recent20: { correct: 0, total: 0 } }
 };
 
 let STREAK_BREAK_MEMORY = {};
 
-// Lưu dự đoán phiên trước để chống dao động
 let LAST_PREDICTION = null; // { side, confidence }
 
 // ─────────────────────────────────────────────
@@ -62,7 +61,7 @@ const getStreak = (data) => {
 };
 
 // ─────────────────────────────────────────────
-//  1. MARKOV CÓ LAPLACE SMOOTHING & GIỚI HẠN CONFIDENCE
+//  1. MARKOV
 // ─────────────────────────────────────────────
 function markovPredict(data) {
   const arr = toArr(data);
@@ -109,7 +108,7 @@ function markovPredict(data) {
 }
 
 // ─────────────────────────────────────────────
-//  2. PATTERN NÂNG CAO (bám bệt + bẻ cầu mạnh)
+//  2. PATTERN NÂNG CAO
 // ─────────────────────────────────────────────
 function patternPredict(data) {
   if (data.length < 5) return { du_doan: null, confidence: 0, loai_cau: "chưa đủ" };
@@ -119,11 +118,10 @@ function patternPredict(data) {
   const t10 = s10.filter(i=>i.ket_qua==='tài').length;
   const x10 = s10.length - t10;
 
-  // 1. Xử lý bệt
+  // 1. Bệt
   if (streak.count >= 3) {
     const key = streak.count;
     if (!STREAK_BREAK_MEMORY[key]) {
-      // Default: khả năng gãy thấp hơn để khuyến khích bám bệt dài
       STREAK_BREAK_MEMORY[key] = { total: 0, broke: 0, default: 0.25 + key * 0.04 };
     }
     const mem = STREAK_BREAK_MEMORY[key];
@@ -131,7 +129,6 @@ function patternPredict(data) {
     breakProb = Math.min(0.85, breakProb);
 
     if (streak.count >= 5) {
-      // Bệt dài: ưu tiên THEO hơn, chỉ bẻ khi bộ nhớ cho thấy xác suất gãy cao
       if (breakProb > 0.6) {
         return {
           du_doan: streak.side === 'tài' ? 'xỉu' : 'tài',
@@ -148,7 +145,6 @@ function patternPredict(data) {
         };
       }
     } else {
-      // Bệt ngắn (3-4)
       if (breakProb >= 0.55) {
         return {
           du_doan: streak.side === 'tài' ? 'xỉu' : 'tài',
@@ -167,13 +163,12 @@ function patternPredict(data) {
     }
   }
 
-  // 2. Phát hiện gãy bệt dài → bẻ cầu mạnh
-  // Nếu phiên trước đó là T dài (>=5), phiên mới nhất là X, dự đoán X tiếp
+  // 2. Gãy bệt dài
   if (data.length >= 6) {
-    const secondStreak = getStreak(data.slice(1)); // bỏ phiên đầu
+    const secondStreak = getStreak(data.slice(1));
     if (secondStreak.count >= 5 && secondStreak.side !== streak.side && streak.count === 1) {
       return {
-        du_doan: data[0].ket_qua, // tiếp tục side vừa gãy
+        du_doan: data[0].ket_qua,
         confidence: 78,
         loai_cau: `gãy bệt ${secondStreak.side}`,
         hanh_dong: "BẺ"
@@ -181,7 +176,7 @@ function patternPredict(data) {
     }
   }
 
-  // 3. Cầu 1-1, 2-2, 3-3, 4-4 (giữ nguyên)
+  // 3. Cầu 1-1, 2-2, 3-3, 4-4
   const detectBlockPattern = (arr, size) => {
     if (arr.length < size * 2) return null;
     let blocks = [];
@@ -206,7 +201,7 @@ function patternPredict(data) {
     if (p) return { ...p, hanh_dong: "THEO" };
   }
 
-  // 4. Nghiêng mạnh
+  // 4. Nghiêng
   if (t10 >= 8 || x10 >= 8) {
     const recent3 = data.slice(0,3).map(i=>i.ket_qua);
     const hasReverse = recent3.some(kq => kq !== (t10>=8?'tài':'xỉu'));
@@ -240,7 +235,7 @@ function patternPredict(data) {
 }
 
 // ─────────────────────────────────────────────
-//  3. DICE (giữ nguyên)
+//  3. DICE
 // ─────────────────────────────────────────────
 function dicePredict(data) {
   if (data.length < 8) return { du_doan: null, confidence: 0 };
@@ -261,7 +256,7 @@ function dicePredict(data) {
 }
 
 // ─────────────────────────────────────────────
-//  4. TREND (giữ nguyên)
+//  4. TREND
 // ─────────────────────────────────────────────
 function trendPredict(data) {
   if (data.length < 8) return { du_doan: null, confidence: 0 };
@@ -288,7 +283,7 @@ function trendPredict(data) {
 }
 
 // ─────────────────────────────────────────────
-//  5. BALANCE (30 phiên)
+//  5. BALANCE
 // ─────────────────────────────────────────────
 function balancePredict(data) {
   if (data.length < 30) return { du_doan: null, confidence: 0 };
@@ -301,105 +296,135 @@ function balancePredict(data) {
 }
 
 // ─────────────────────────────────────────────
-//  CHỌN MODEL DỰA TRÊN RECENT20 + AN TOÀN
+//  ENTROPY & MODEL SELECTION
 // ─────────────────────────────────────────────
-function getBestModels() {
-  const stats = PREDICTOR_STATS;
-  const models = ['markov', 'cau', 'dice', 'trend', 'balance']
-    .map(key => ({
-      name: key,
-      acc: stats[key].recent20.total >= 5
-        ? stats[key].recent20.correct / stats[key].recent20.total
-        : (stats[key].total > 0 ? stats[key].correct / stats[key].total : 0.5),
-      total: stats[key].recent20.total
-    }))
-    .filter(m => m.total >= 2 || m.acc > 0.55)
-    .sort((a, b) => b.acc - a.acc);
+function calcEntropy(data, len = 10) {
+    const sample = data.slice(0, len);
+    const tCount = sample.filter(i => i.ket_qua === 'tài').length;
+    const ratio = tCount / sample.length;
+    if (ratio === 0 || ratio === 1) return 0;
+    return -(ratio * Math.log2(ratio) + (1 - ratio) * Math.log2(1 - ratio));
+}
 
-  if (models.length === 0) {
-    return ['markov', 'cau', 'dice', 'trend', 'balance'].map(name => ({ name, acc: 0.5 }));
-  }
-  return models.slice(0, 3); // lấy top 3 thay vì top 2
+function getBestModels() {
+    const stats = PREDICTOR_STATS;
+    const models = ['markov', 'cau', 'dice', 'trend', 'balance']
+        .map(key => ({
+            name: key,
+            acc: stats[key].recent20.total >= 5
+                ? stats[key].recent20.correct / stats[key].recent20.total
+                : (stats[key].total > 0 ? stats[key].correct / stats[key].total : 0.5),
+            total: stats[key].recent20.total
+        }))
+        .filter(m => m.total >= 2 || m.acc > 0.55)
+        .sort((a, b) => b.acc - a.acc);
+
+    if (models.length === 0) {
+        return ['markov', 'cau', 'dice', 'trend', 'balance'].map(name => ({ name, acc: 0.5 }));
+    }
+    return models.slice(0, 3); // top 3
 }
 
 // ─────────────────────────────────────────────
-//  ENSEMBLE CUỐI CÙNG (có chống dao động)
+//  ENSEMBLE CUỐI CÙNG
 // ─────────────────────────────────────────────
 function finalPredict(data) {
-  const mk = markovPredict(data);
-  const pt = patternPredict(data);
-  const dc = dicePredict(data);
-  const tr = trendPredict(data);
-  const bl = balancePredict(data);
+    const mk = markovPredict(data);
+    const pt = patternPredict(data);
+    const dc = dicePredict(data);
+    const tr = trendPredict(data);
+    const bl = balancePredict(data);
 
-  const predictions = { markov: mk, cau: pt, dice: dc, trend: tr, balance: bl };
+    const predictions = { markov: mk, cau: pt, dice: dc, trend: tr, balance: bl };
 
-  const last20 = data.slice(0, 20);
-  const t20 = last20.filter(i => i.ket_qua === 'tài').length;
-  const balanceRatio = t20 / last20.length;
+    const last20 = data.slice(0, 20);
+    const t20 = last20.filter(i => i.ket_qua === 'tài').length;
+    const balanceRatio = t20 / last20.length;
 
-  const bestModels = getBestModels();
-  let weightedTai = 0, weightedXiu = 0, totalWeight = 0;
+    const bestModels = getBestModels();
+    let weightedTai = 0, weightedXiu = 0, totalWeight = 0;
 
-  // Thêm model thị trường khi cực nghiêng
-  if (balanceRatio > 0.7 || balanceRatio < 0.3) {
-    const side = balanceRatio > 0.7 ? 'tài' : 'xỉu';
-    const trendModel = { name: 'market_trend', du_doan: side, confidence: 75 };
-    predictions.market_trend = trendModel;
-    bestModels.unshift({ name: 'market_trend', acc: 0.8 });
-  }
-
-  for (let model of bestModels) {
-    const pred = predictions[model.name];
-    if (!pred || !pred.du_doan) continue;
-    // Chỉ bỏ qua model có confidence quá thấp và không phải market_trend
-    if (pred.confidence < 53 && model.name !== 'market_trend') continue;
-    const w = model.acc * (pred.confidence / 100);
-    if (pred.du_doan === "tài") weightedTai += w;
-    else weightedXiu += w;
-    totalWeight += w;
-  }
-
-  let finalSide, confidence;
-  if (totalWeight === 0) {
-    // Fallback
-    const s5 = data.slice(0,5).filter(i=>i.ket_qua==='tài').length;
-    finalSide = s5 >= 3 ? 'tài' : 'xỉu';
-    confidence = 53;
-  } else {
-    finalSide = weightedTai >= weightedXiu ? "tài" : "xỉu";
-    confidence = Math.min(92, Math.round(Math.max(weightedTai, weightedXiu) / totalWeight * 100));
-  }
-
-  // Chống dao động: nếu dự đoán thay đổi so với phiên trước, giảm confidence
-  if (LAST_PREDICTION && finalSide !== LAST_PREDICTION.side) {
-    // Yêu cầu confidence tối thiểu 58% để thay đổi
-    if (confidence < 58) {
-      finalSide = LAST_PREDICTION.side;
-      confidence = Math.max(confidence, LAST_PREDICTION.confidence - 5); // giảm một chút
-    } else {
-      // nếu đủ mạnh, chấp nhận đổi nhưng giảm nhẹ
-      confidence = Math.max(confidence - 3, 55);
+    // Model thị trường khi cực nghiêng
+    if (balanceRatio > 0.7 || balanceRatio < 0.3) {
+        const side = balanceRatio > 0.7 ? 'tài' : 'xỉu';
+        const trendModel = { name: 'market_trend', du_doan: side, confidence: 75 };
+        predictions.market_trend = trendModel;
+        bestModels.unshift({ name: 'market_trend', acc: 0.8 });
     }
-  }
 
-  LAST_PREDICTION = { side: finalSide, confidence };
+    for (let model of bestModels) {
+        const pred = predictions[model.name];
+        if (!pred || !pred.du_doan) continue;
+        if (pred.confidence < 53 && model.name !== 'market_trend') continue;
+        const w = model.acc * (pred.confidence / 100);
+        if (pred.du_doan === "tài") weightedTai += w;
+        else weightedXiu += w;
+        totalWeight += w;
+    }
 
-  const loai_cau = pt.loai_cau || (balanceRatio > 0.55 ? 'thiên tài' : 'thiên xỉu');
-  const hanh_dong = pt.hanh_dong || (finalSide === data[0].ket_qua ? "THEO" : "BẺ");
+    let finalSide, rawConfidence;
+    if (totalWeight === 0) {
+        const s5 = data.slice(0,5).filter(i=>i.ket_qua==='tài').length;
+        finalSide = s5 >= 3 ? 'tài' : 'xỉu';
+        rawConfidence = 53;
+    } else {
+        finalSide = weightedTai >= weightedXiu ? "tài" : "xỉu";
+        rawConfidence = Math.round(Math.max(weightedTai, weightedXiu) / totalWeight * 100);
+    }
 
-  return {
-    du_doan: finalSide,
-    do_tin_cay: confidence,
-    loai_cau,
-    hanh_dong,
-    canh_bao: `🎯 ${loai_cau} | ${finalSide} (${confidence}%)`,
-    thuat_toan: { markov: mk, cau: pt, dice: dc, trend: tr, balance: bl, bestModels: bestModels.map(m=>m.name) }
-  };
+    // --- KIỂM SOÁT CONFIDENCE ---
+    let confidence = rawConfidence;
+
+    // Không vượt quá 85%
+    confidence = Math.min(85, confidence);
+
+    // Phạt nếu tất cả model cùng ý (đồng thuận tuyệt đối)
+    const allAgree = bestModels.every(model => {
+        const p = predictions[model.name];
+        return p && p.du_doan === finalSide;
+    });
+    if (allAgree && bestModels.length >= 3) {
+        confidence = Math.round(confidence * 0.85);
+    }
+
+    // Phạt theo entropy thị trường (cầu cân bằng -> dễ đảo)
+    const entropy = calcEntropy(data, 10);
+    if (entropy > 0.85) {
+        confidence = Math.round(confidence * 0.8);
+    } else if (entropy > 0.7) {
+        confidence = Math.round(confidence * 0.9);
+    }
+
+    // Đảm bảo tối thiểu
+    confidence = Math.max(51, confidence);
+
+    // --- CHỐNG DAO ĐỘNG ---
+    if (LAST_PREDICTION && finalSide !== LAST_PREDICTION.side) {
+        if (confidence < 58) {
+            finalSide = LAST_PREDICTION.side;
+            confidence = Math.max(confidence, LAST_PREDICTION.confidence - 4);
+        } else {
+            confidence = Math.max(confidence - 3, 55);
+        }
+    }
+
+    LAST_PREDICTION = { side: finalSide, confidence };
+
+    const loai_cau = pt.loai_cau || (balanceRatio > 0.55 ? 'thiên tài' : 'thiên xỉu');
+    const hanh_dong = pt.hanh_dong || (finalSide === data[0].ket_qua ? "THEO" : "BẺ");
+
+    return {
+        du_doan: finalSide,
+        do_tin_cay: confidence,
+        loai_cau,
+        hanh_dong,
+        canh_bao: `🎯 ${loai_cau} | ${finalSide} (${confidence}%)`,
+        thuat_toan: { markov: mk, cau: pt, dice: dc, trend: tr, balance: bl, bestModels: bestModels.map(m=>m.name) }
+    };
 }
 
 // ─────────────────────────────────────────────
-//  CẬP NHẬT THỐNG KÊ (có thêm market_trend)
+//  CẬP NHẬT THỐNG KÊ
 // ─────────────────────────────────────────────
 function updatePredictorStats() {
   const checked = HISTORY.filter(h => h.checked);
