@@ -31,6 +31,7 @@ let CACHE = {
 
 let HISTORY = [];
 let LAST_PREDICTION = null;
+let CONSECUTIVE_ERRORS = 0; // đếm số lần sai liên tiếp để giảm rủi ro
 
 // ─────────────────────────────────────────────
 //  TIỆN ÍCH
@@ -49,57 +50,103 @@ const getStreak = (data) => {
 };
 
 // ─────────────────────────────────────────────
-//  NHẬN DIỆN CẦU NÂNG CAO (PATTERN) – phiên bản 2
+//  PHÂN TÍCH XÚC XẮC (TỔNG ĐIỂM)
 // ─────────────────────────────────────────────
-function patternPredict(data) {
-  if (data.length < 4) return { du_doan: null, confidence: 0, loai_cau: "chưa đủ" };
+function diceAnalysis(data) {
+  if (data.length < 5) return { scoreTai: 50, scoreXiu: 50, reason: "chưa đủ dữ liệu" };
+
+  const totals = data.slice(0, 15).map(i => i.total); // tối đa 15 phiên gần
+  const n = totals.length;
+  const sum = totals.reduce((a, b) => a + b, 0);
+  const avg = sum / n;
+  const median = totals.slice().sort((a,b)=>a-b)[Math.floor(n/2)];
+  const last = totals[0];
+  const last3 = totals.slice(0, 3);
+  const avgLast3 = last3.reduce((a,b)=>a+b,0) / 3;
+
+  // Tính xu hướng tổng (slope đơn giản)
+  let slope = 0;
+  if (n >= 6) {
+    const xMean = (n - 1) / 2;
+    const yMean = avg;
+    let num = 0, den = 0;
+    for (let i = 0; i < n; i++) {
+      num += (i - xMean) * (totals[i] - yMean);
+      den += (i - xMean) ** 2;
+    }
+    if (den !== 0) slope = num / den;
+  }
+
+  // Điểm dựa trên vị trí so với 11.5 (tài >= 11)
+  // Cao hơn 11.5 -> nghiêng về tài, thấp hơn -> xỉu, nhưng có hồi quy
+  let scoreTai = 50;
+  let scoreXiu = 50;
+
+  // Yếu tố 1: Giá trị trung bình
+  if (avg > 12.5) { scoreTai -= 20; scoreXiu += 20; } // quá cao -> về xỉu
+  else if (avg > 11.5) { scoreTai -= 10; scoreXiu += 10; }
+  else if (avg < 9.5) { scoreTai += 20; scoreXiu -= 20; }
+  else if (avg < 10.5) { scoreTai += 10; scoreXiu -= 10; }
+
+  // Yếu tố 2: Phiên cuối cùng
+  if (last >= 13) { scoreTai -= 15; scoreXiu += 15; }
+  else if (last <= 8) { scoreTai += 15; scoreXiu -= 15; }
+  else if (last >= 11) { scoreTai += 5; scoreXiu -= 5; }
+  else if (last <= 10) { scoreTai -= 5; scoreXiu += 5; }
+
+  // Yếu tố 3: Xu hướng (slope)
+  if (slope > 0.3) { scoreTai += 10; scoreXiu -= 10; } // tổng đang tăng -> tài
+  else if (slope < -0.3) { scoreTai -= 10; scoreXiu += 10; }
+
+  // Yếu tố 4: Trung bình 3 phiên gần nhất
+  if (avgLast3 > 12) { scoreTai -= 10; scoreXiu += 10; }
+  else if (avgLast3 < 9) { scoreTai += 10; scoreXiu -= 10; }
+
+  // Chuẩn hóa điểm trong khoảng 0-100
+  scoreTai = Math.max(0, Math.min(100, scoreTai));
+  scoreXiu = Math.max(0, Math.min(100, scoreXiu));
+
+  return {
+    scoreTai,
+    scoreXiu,
+    reason: `Avg=${avg.toFixed(1)} Last=${last} Slope=${slope.toFixed(2)}`
+  };
+}
+
+// ─────────────────────────────────────────────
+//  NHẬN DIỆN CẦU (PATTERN) MỀM DẺO
+// ─────────────────────────────────────────────
+function patternAnalysis(data) {
+  if (data.length < 4) return { scoreTai: 50, scoreXiu: 50, loai_cau: "chưa đủ", hanh_dong: "-" };
+
   const arr = toArr(data);
   const n = arr.length;
-
-  // Thống kê nhanh 10 phiên gần
-  const last10 = data.slice(0, 10);
-  const t10 = last10.filter(i => i.ket_qua === 'tài').length;
-  const x10 = last10.length - t10;
-
   const streak = getStreak(data);
+  const s10 = data.slice(0,10);
+  const t10 = s10.filter(i=>i.ket_qua==='tài').length;
+  const x10 = s10.length - t10;
 
-  // ----- 1. Phát hiện chu kỳ lặp (cycle) -----
-  // tìm chu kỳ từ 2 đến 5, ưu tiên chu kỳ ngắn
-  for (let L = 2; L <= 5; L++) {
-    if (n < L * 2) continue;
-    const seg1 = arr.slice(0, L);
-    const seg2 = arr.slice(L, L * 2);
-    if (seg1.join('') === seg2.join('')) {
-      // Kiểm tra không phải toàn bộ giống nhau (bệt)
-      if (new Set(seg1).size === 1) continue; // bỏ qua nếu là bệt lặp
-      // Dự đoán: phần tử tiếp theo = phần tử đầu chu kỳ (seg1[0])
-      const next = seg1[0] === 'T' ? 'tài' : 'xỉu';
-      return {
-        du_doan: next,
-        confidence: 85,
-        loai_cau: `chu kỳ ${L}`,
-        hanh_dong: "THEO"
-      };
-    }
-  }
+  let scoreTai = 50, scoreXiu = 50;
+  let loai_cau = "không rõ";
+  let hanh_dong = "-";
 
-  // ----- 2. Cầu 1-1 (đảo liên tục) -----
-  if (n >= 4) {
+  // 1. Cầu 1-1 (đảo liên tục) – mạnh
+  if (n >= 5) {
     let is1_1 = true;
-    for (let i = 0; i < Math.min(n - 1, 6); i++) {
-      if (arr[i] === arr[i + 1]) { is1_1 = false; break; }
+    for (let i = 0; i < 5; i++) {
+      if (arr[i] === arr[i+1]) { is1_1 = false; break; }
     }
     if (is1_1) {
-      return {
-        du_doan: arr[0] === 'T' ? 'xỉu' : 'tài',
-        confidence: 82,
-        loai_cau: "cầu 1-1",
-        hanh_dong: "THEO"
-      };
+      const next = arr[0] === 'T' ? 'xỉu' : 'tài';
+      loai_cau = "cầu 1-1";
+      hanh_dong = "THEO";
+      if (next === 'tài') { scoreTai = 85; scoreXiu = 15; }
+      else { scoreTai = 15; scoreXiu = 85; }
+      return { scoreTai, scoreXiu, loai_cau, hanh_dong };
     }
   }
 
-  // ----- 3. Cầu khối (block) 2-2, 3-3, 4-4 -----
+  // 2. Cầu khối 2-2, 3-3, 4-4
   const detectBlock = (size) => {
     if (n < size * 2) return null;
     let blocks = [];
@@ -115,143 +162,149 @@ function patternPredict(data) {
     for (let j = 1; j < blocks.length; j++) {
       if (blocks[j] === blocks[j-1]) return null;
     }
-    const next = blocks[blocks.length - 1] === 'T' ? 'X' : 'T';
-    return { side: next === 'T' ? 'tài' : 'xỉu', confidence: 85, loai_cau: `${size}-${size}` };
+    const next = blocks[blocks.length-1] === 'T' ? 'X' : 'T';
+    return { side: next === 'T' ? 'tài' : 'xỉu', size };
   };
-  for (let size of [4, 3, 2]) {
+
+  for (let size of [4,3,2]) {
     const block = detectBlock(size);
-    if (block) return { ...block, hanh_dong: "THEO" };
+    if (block) {
+      loai_cau = `cầu ${size}-${size}`;
+      hanh_dong = "THEO";
+      if (block.side === 'tài') { scoreTai = 80; scoreXiu = 20; }
+      else { scoreTai = 20; scoreXiu = 80; }
+      return { scoreTai, scoreXiu, loai_cau, hanh_dong };
+    }
   }
 
-  // ----- 4. Xử lý bệt (streak) -----
+  // 3. Bệt
   if (streak.count >= 3) {
-    const oppositeSide = streak.side === 'tài' ? 'xỉu' : 'tài';
-    const oppositeCount = oppositeSide === 'tài' ? t10 : x10;
-    const sameCount = streak.side === 'tài' ? t10 : x10;
-
-    // Nếu bệt dài >=5 và thị trường ủng hộ (sameCount >=7) => THEO
-    if (streak.count >= 5 && sameCount >= 7) {
-      return {
-        du_doan: streak.side,
-        confidence: 78,
-        loai_cau: `bệt dài ${streak.side} (ủng hộ)`,
-        hanh_dong: "THEO"
-      };
-    }
-    // Nếu bệt >=4 và bên kia áp đảo (oppositeCount >=7) => BẺ
-    if (streak.count >= 4 && oppositeCount >= 7) {
-      return {
-        du_doan: oppositeSide,
-        confidence: 72,
-        loai_cau: `bẻ bệt ${streak.side} (đảo nghiêng)`,
-        hanh_dong: "BẺ"
-      };
-    }
-    // Các trường hợp còn lại
-    if (streak.count >= 6) {
-      // Bệt rất dài nhưng không có ủng hộ rõ => vẫn bẻ an toàn
-      return {
-        du_doan: oppositeSide,
-        confidence: 65,
-        loai_cau: `bệt rất dài ${streak.side}`,
-        hanh_dong: "BẺ"
-      };
-    }
-    if (streak.count >= 4) {
-      // Bệt 4-5: bẻ nếu oppositeCount >= 4
-      if (oppositeCount >= 4) {
-        return {
-          du_doan: oppositeSide,
-          confidence: 62,
-          loai_cau: `bẻ bệt ${streak.side}`,
-          hanh_dong: "BẺ"
-        };
+    const opposite = streak.side === 'tài' ? 'xỉu' : 'tài';
+    if (streak.count >= 7) {
+      // Bệt rất dài -> bẻ mạnh
+      loai_cau = `bệt dài ${streak.side}`;
+      hanh_dong = "BẺ";
+      if (opposite === 'tài') { scoreTai = 70; scoreXiu = 30; }
+      else { scoreTai = 30; scoreXiu = 70; }
+    } else if (streak.count >= 4) {
+      // Bệt trung bình -> bẻ nhẹ
+      loai_cau = `bệt ${streak.side}`;
+      hanh_dong = "BẺ";
+      if (opposite === 'tài') { scoreTai = 65; scoreXiu = 35; }
+      else { scoreTai = 35; scoreXiu = 65; }
+    } else {
+      // Bệt ngắn 3 -> theo hoặc bẻ tùy nghiêng
+      if (t10 >= 6 && streak.side === 'tài') {
+        loai_cau = `bệt ngắn ${streak.side} + nghiêng`;
+        hanh_dong = "THEO";
+        if (streak.side === 'tài') { scoreTai = 60; scoreXiu = 40; }
+        else { scoreTai = 40; scoreXiu = 60; }
+      } else if (x10 >= 6 && streak.side === 'xỉu') {
+        loai_cau = `bệt ngắn ${streak.side} + nghiêng`;
+        hanh_dong = "THEO";
+        if (streak.side === 'tài') { scoreTai = 60; scoreXiu = 40; }
+        else { scoreTai = 40; scoreXiu = 60; }
       } else {
-        return {
-          du_doan: streak.side,
-          confidence: 60,
-          loai_cau: `bệt ${streak.side} (theo)`,
-          hanh_dong: "THEO"
-        };
+        loai_cau = `bệt ngắn ${streak.side}`;
+        hanh_dong = "BẺ";
+        if (opposite === 'tài') { scoreTai = 55; scoreXiu = 45; }
+        else { scoreTai = 45; scoreXiu = 55; }
       }
     }
-    // Bệt 3
-    if (oppositeCount >= 5) {
-      return {
-        du_doan: oppositeSide,
-        confidence: 58,
-        loai_cau: `bẻ bệt ngắn ${streak.side}`,
-        hanh_dong: "BẺ"
-      };
-    } else {
-      return {
-        du_doan: streak.side,
-        confidence: 57,
-        loai_cau: `bệt ngắn ${streak.side}`,
-        hanh_dong: "THEO"
-      };
-    }
+    return { scoreTai, scoreXiu, loai_cau, hanh_dong };
   }
 
-  // ----- 5. Nghiêng 10 phiên -----
-  if (t10 >= 7 || x10 >= 7) {
+  // 4. Nghiêng 10 phiên
+  if (t10 >= 8 || x10 >= 8) {
+    const side = t10 >= 8 ? 'tài' : 'xỉu';
+    loai_cau = `cực nghiêng ${side}`;
+    hanh_dong = "BẺ";
+    if (side === 'tài') { scoreTai = 25; scoreXiu = 75; }
+    else { scoreTai = 75; scoreXiu = 25; }
+  } else if (t10 >= 7 || x10 >= 7) {
     const side = t10 >= 7 ? 'tài' : 'xỉu';
-    if (t10 >= 8 || x10 >= 8) {
-      // cực nghiêng -> bẻ
-      return {
-        du_doan: side === 'tài' ? 'xỉu' : 'tài',
-        confidence: 70,
-        loai_cau: `cực nghiêng ${side}`,
-        hanh_dong: "BẺ"
-      };
+    loai_cau = `nghiêng ${side}`;
+    hanh_dong = "THEO";
+    if (side === 'tài') { scoreTai = 65; scoreXiu = 35; }
+    else { scoreTai = 35; scoreXiu = 65; }
+  } else {
+    // Không rõ ràng, dùng xu hướng 3 phiên gần nhất
+    const last3 = data.slice(0,3).filter(i=>i.ket_qua==='tài').length;
+    if (last3 >= 2) {
+      loai_cau = "xu hướng ngắn tài";
+      hanh_dong = "THEO";
+      scoreTai = 60; scoreXiu = 40;
     } else {
-      // 7-3 -> theo xu hướng
-      return {
-        du_doan: side,
-        confidence: 66,
-        loai_cau: `nghiêng ${side}`,
-        hanh_dong: "THEO"
-      };
+      loai_cau = "xu hướng ngắn xỉu";
+      hanh_dong = "THEO";
+      scoreTai = 40; scoreXiu = 60;
     }
   }
 
-  // ----- 6. Không rõ -> xu hướng 3 phiên gần nhất -----
-  const last3 = data.slice(0, 3).filter(i => i.ket_qua === 'tài').length;
-  if (last3 >= 2) {
-    return { du_doan: 'tài', confidence: 55, loai_cau: 'xu hướng ngắn', hanh_dong: 'THEO' };
-  } else if (last3 <= 1) {
-    return { du_doan: 'xỉu', confidence: 55, loai_cau: 'xu hướng ngắn', hanh_dong: 'THEO' };
-  }
-
-  return { du_doan: null, confidence: 0, loai_cau: "không rõ" };
+  return { scoreTai, scoreXiu, loai_cau, hanh_dong };
 }
 
 // ─────────────────────────────────────────────
-//  DỰ ĐOÁN CUỐI CÙNG
+//  KẾT HỢP DỰ ĐOÁN (ENSEMBLE)
 // ─────────────────────────────────────────────
 function finalPredict(data) {
-  const pt = patternPredict(data);
-  if (pt.du_doan) {
-    LAST_PREDICTION = { side: pt.du_doan, confidence: pt.confidence };
-    return {
-      du_doan: pt.du_doan,
-      do_tin_cay: pt.confidence,
-      loai_cau: pt.loai_cau,
-      hanh_dong: pt.hanh_dong,
-      canh_bao: `🎯 ${pt.loai_cau} | ${pt.du_doan} (${pt.confidence}%)`
-    };
+  const dice = diceAnalysis(data);
+  const patt = patternAnalysis(data);
+
+  // Trọng số: xúc xắc 60%, pattern 40% (coi trọng dữ liệu xúc xắc hơn)
+  const wDice = 0.6, wPatt = 0.4;
+  let finalTai = dice.scoreTai * wDice + patt.scoreTai * wPatt;
+  let finalXiu = dice.scoreXiu * wDice + patt.scoreXiu * wPatt;
+
+  // Điều chỉnh nếu đang có chuỗi sai liên tiếp -> giảm độ tự tin, nghiêng về an toàn
+  if (CONSECUTIVE_ERRORS >= 2) {
+    // giảm chênh lệch
+    const mid = (finalTai + finalXiu) / 2;
+    finalTai = mid + (finalTai - mid) * 0.5;
+    finalXiu = mid + (finalXiu - mid) * 0.5;
   }
 
-  // Fallback an toàn
-  const last = data[0]?.ket_qua;
-  const fallback = last === 'tài' ? 'xỉu' : 'tài';
-  LAST_PREDICTION = { side: fallback, confidence: 50 };
+  let du_doan, confidence, hanh_dong, loai_cau;
+
+  const diff = finalTai - finalXiu;
+  if (diff > 0) {
+    du_doan = "tài";
+    confidence = Math.round(50 + diff * 0.5);
+  } else {
+    du_doan = "xỉu";
+    confidence = Math.round(50 + (-diff) * 0.5);
+  }
+
+  // Giới hạn confidence 50-85
+  confidence = Math.min(85, Math.max(50, confidence));
+
+  // Xác định hành động và loại cầu từ pattern (để hiển thị)
+  loai_cau = patt.loai_cau;
+  hanh_dong = patt.hanh_dong;
+  if (loai_cau === "không rõ") {
+    loai_cau = `phân tích xúc xắc: ${dice.reason}`;
+    hanh_dong = du_doan === data[0]?.ket_qua ? "THEO" : "BẺ";
+  }
+
+  // Chống dao động: nếu dự đoán mới trái ngược với dự đoán trước và độ tin cậy không cao hơn 10, giữ nguyên
+  if (LAST_PREDICTION && LAST_PREDICTION.side !== du_doan) {
+    if (confidence < LAST_PREDICTION.confidence + 10) {
+      du_doan = LAST_PREDICTION.side;
+      confidence = LAST_PREDICTION.confidence;
+      loai_cau += " (giữ)";
+    }
+  }
+
+  LAST_PREDICTION = { side: du_doan, confidence };
+
+  const canh_bao = `🎯 ${loai_cau} | ${du_doan} (${confidence}%)`;
+
   return {
-    du_doan: fallback,
-    do_tin_cay: 50,
-    loai_cau: "không rõ",
-    hanh_dong: "BẺ",
-    canh_bao: "⚠️ Không rõ cầu - bẻ ngược"
+    du_doan,
+    do_tin_cay: confidence,
+    loai_cau,
+    hanh_dong,
+    canh_bao
   };
 }
 
@@ -269,6 +322,8 @@ function verifyHistory(parsed) {
       h.checked = true;
       h.thuc_te = real;
       h.dung = h.du_doan === real;
+      if (!h.dung) CONSECUTIVE_ERRORS++;
+      else CONSECUTIVE_ERRORS = 0;
     }
   }
   if (HISTORY.length > 100) HISTORY = HISTORY.slice(-100);
@@ -367,7 +422,7 @@ app.get("/predict", (req, res) => res.json({ status: "success", data: CACHE }));
 app.get("/algorithms", (req, res) => {
   res.json({
     status: "success",
-    method: "Nhận diện cầu nâng cao: chu kỳ, 1-1, block, bệt thông minh + phân tích thị trường"
+    method: "Phân tích xúc xắc (tổng, xu hướng, hồi quy) + nhận diện cầu thông minh, kết hợp ensemble"
   });
 });
 
@@ -376,5 +431,5 @@ updateData();
 setInterval(updateData, 5000);
 
 app.listen(PORT, () => {
-  console.log(`\n🎲 Tài Xỉu AI v3 — cổng ${PORT}`);
+  console.log(`\n🎲 Tài Xỉu AI v4 (Ổn định cao) — cổng ${PORT}`);
 });
