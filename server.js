@@ -1,4 +1,4 @@
-// server.js — Tài Xỉu AI v7 (VIP Pro: Nhận dạng cầu chuẩn + Theo/Bẻ thông minh)
+// server.js — Tài Xỉu AI v8 (VIP Pro Max: Siêu bẻ cầu, Theo cầu đỉnh, Phát hiện nhà cái chỉnh)
 const express = require("express");
 const axios   = require("axios");
 const cors    = require("cors");
@@ -26,8 +26,13 @@ let HISTORY          = [];   // lịch sử dự đoán đã ghi
 let LAST_PREDICTION  = null; // { side, confidence, type, cycle_id }
 let PATTERN_STATS    = {};   // { type: { total, correct, streak_correct, streak_wrong } }
 let CONSECUTIVE_ERRORS = 0;
-let CURRENT_CYCLE    = null; // cầu đang theo dõi { id, type, period, startIdx, errCount, totalFollowed }
-let CYCLE_ID         = 0;    // unique id cho mỗi cầu phát hiện
+let CURRENT_CYCLE    = null; // cầu đang theo dõi { id, period, label, hits, errCount, totalFollowed }
+let CYCLE_ID         = 0;
+
+// Biến phát hiện nhà cái chỉnh cầu
+let CASINO_SUSPICION = false;
+let RECENT_ACC_20    = 0.5;  // accuracy 20 phiên gần nhất
+let MARKET_REGIME    = "BÌNH THƯỜNG"; // "BÌNH THƯỜNG" | "CAN THIỆP"
 
 // ════════════════════════════════════════════════════════════════
 //  TIỆN ÍCH
@@ -37,26 +42,24 @@ const toTX  = item => item.ket_qua === "tài" ? "T" : "X";
 const toArr = data => data.map(toTX);
 
 // ════════════════════════════════════════════════════════════════
-//  PHÂN TÍCH XÚC XẮC NÂNG CAO
+//  PHÂN TÍCH XÚC XẮC NÂNG CAO (giữ nguyên)
 // ════════════════════════════════════════════════════════════════
 function diceAnalysis(data) {
   const totals = data.slice(0, 25).map(i => i.total);
   const n = totals.length;
-  if (n < 4) return { bias: 0, volatile: false, diceConf: 50 };
+  if (n < 4) return { bias: 0, volatile: false, avg5: "0", stdDev: "0", diceConf: 50 };
 
   const last5 = totals.slice(0, 5);
   const avg5  = last5.reduce((a, b) => a + b, 0) / 5;
   const var5  = last5.reduce((s, v) => s + (v - avg5) ** 2, 0) / 5;
   const stdDev = Math.sqrt(var5);
 
-  // Xu hướng tuyến tính (arr[0]=mới nhất)
   const yMean = totals.reduce((a, b) => a + b, 0) / n;
   let num = 0, den = 0;
   for (let i = 0; i < n; i++) { num += (i - (n - 1) / 2) * (totals[i] - yMean); den += (i - (n - 1) / 2) ** 2; }
   const slope = den ? num / den : 0;
   const trendBias = -slope * 3.0;
 
-  // Hồi quy về trung bình
   let revBias = 0;
   if (avg5 > 14)    revBias = -20;
   else if (avg5 > 13)   revBias = -12;
@@ -65,7 +68,6 @@ function diceAnalysis(data) {
   else if (avg5 < 8)    revBias = 12;
   else if (avg5 < 8.5)  revBias = 6;
 
-  // Điểm cuối
   const lt = totals[0];
   let lastBias = 0;
   if      (lt >= 16) lastBias = -18;
@@ -84,14 +86,9 @@ function diceAnalysis(data) {
 }
 
 // ════════════════════════════════════════════════════════════════
-//  NHẬN DẠNG CẦU — phân tích chi tiết từng loại
-//  Trả về mảng các ứng viên cầu với điểm ưu tiên
+//  NHẬN DẠNG CẦU (giữ nguyên core, bổ sung ngưỡng an toàn)
 // ════════════════════════════════════════════════════════════════
 
-/**
- * Xác định chuỗi BỆTH (arr[0] mới nhất):
- * Đếm xem arr[0] lặp liên tiếp bao nhiêu phần tử.
- */
 function detectStreak(arr) {
   if (!arr.length) return { val: null, len: 0 };
   const v = arr[0];
@@ -100,82 +97,44 @@ function detectStreak(arr) {
   return { val: v, len: l };
 }
 
-/**
- * Nhận dạng cầu theo chu kỳ p từ mảng arr (arr[0]=mới nhất).
- * Cần ít nhất 2 chu kỳ đầy đủ để xác nhận.
- * Trả về: { period, hits, totalContig, next, strength, label } hoặc null
- */
 function detectPeriod(arr, p) {
   const len = arr.length;
-  if (len < p * 2) return null;          // cần ít nhất 2 chu kỳ
+  if (len < p * 2) return null;
 
-  // Đếm số vị trí liên tiếp từ đầu mà arr[i] === arr[i+p]
   let contig = 0;
   for (let i = 0; i + p < len; i++) {
     if (arr[i] === arr[i + p]) contig++;
     else break;
   }
-  // Cần ít nhất 2 chu kỳ liên tục -> contig >= 2*p-1? Không: contig >= p đủ cho 2 chu kỳ (p cặp)
-  // Thực tế: contig >= p*2 nghĩa là 3 chu kỳ liên tục — bắt cầu nhanh hơn thì dùng >= p*1
-  // Ta dùng >= p (bắt cầu nhanh: 2 chu kỳ là đủ)
-  const minContig = p; // = 1 chu kỳ khớp (đủ để xác nhận 2 chu kỳ tổng)
-  if (contig < minContig) return null;
+  if (contig < p) return null;
 
-  // Lấy đoạn p phần tử mới nhất làm "template" của một chu kỳ
-  // Phần tử tiếp theo (phiên kế) = arr[p-1] (theo logic đảo ngược)
   const next     = arr[p - 1];
-  const strength = contig * (1 + p * 0.15); // chu kỳ dài có thêm điểm
-
+  const strength = contig * (1 + p * 0.15);
   return { period: p, hits: contig, next, strength };
 }
 
-/**
- * Tạo nhãn đẹp cho từng loại cầu
- */
 function buildCycleLabel(period, arr) {
-  // Lấy p phần tử mới nhất làm mẫu để đặt tên
-  const sample = arr.slice(0, period).reverse(); // đảo lại: [cũ → mới]
-  const raw    = sample.join(""); // vd: "TX", "TTX"
-
-  // Một số tên đặc biệt
+  const sample = arr.slice(0, period).reverse();
+  const raw    = sample.join("");
   const special = {
-    "T":    "bệt tài",
-    "X":    "bệt xỉu",
-    "TX":   "cầu 1-1 (T→X)",
-    "XT":   "cầu 1-1 (X→T)",
-    "TTX":  "cầu 2-1 (bẻ xỉu)",
-    "TXX":  "cầu 1-2 (bẻ tài)",
-    "XXT":  "cầu 2-1 (bẻ tài)",
-    "XTT":  "cầu 1-2 (bẻ xỉu)",
-    "TTTX": "cầu 3-1",
-    "TXXX": "cầu 1-3",
-    "XXXT": "cầu 3-1 (xỉu)",
-    "XTTT": "cầu 1-3 (xỉu→tài)",
-    "TTT":  "bệt 3 tài",
-    "XXX":  "bệt 3 xỉu",
-    "TTTT": "bệt 4 tài",
-    "XXXX": "bệt 4 xỉu",
-    "TTTTT":"bệt 5 tài",
-    "XXXXX":"bệt 5 xỉu",
-    "TXTX": "cầu 1-1-1-1",
-    "XTXT": "cầu 1-1-1-1 (x)",
-    "TTXX": "cầu 2-2",
-    "XXTT": "cầu 2-2 (x)",
-    "TTTXXX":"cầu 3-3",
-    "XXXTTT":"cầu 3-3 (x)",
-    "TTTTXXXX":"cầu 4-4",
-    "TTTTTXXXXX":"cầu 5-5",
-    "TXTXT":"cầu 3-1-3 (mẫu TX)",
-    "XTXXT":"cầu 3-1-3 (mẫu XT)",
-    "TXTTXT":"cầu 4-1",
+    "T": "bệt tài", "X": "bệt xỉu",
+    "TX": "cầu 1-1 (T→X)", "XT": "cầu 1-1 (X→T)",
+    "TTX": "cầu 2-1 (bẻ xỉu)", "TXX": "cầu 1-2 (bẻ tài)",
+    "XXT": "cầu 2-1 (bẻ tài)", "XTT": "cầu 1-2 (bẻ xỉu)",
+    "TTTX": "cầu 3-1", "TXXX": "cầu 1-3",
+    "XXXT": "cầu 3-1 (xỉu)", "XTTT": "cầu 1-3 (xỉu→tài)",
+    "TTT": "bệt 3 tài", "XXX": "bệt 3 xỉu",
+    "TTTT": "bệt 4 tài", "XXXX": "bệt 4 xỉu",
+    "TTTTT":"bệt 5 tài", "XXXXX":"bệt 5 xỉu",
+    "TXTX": "cầu 1-1-1-1", "XTXT": "cầu 1-1-1-1 (x)",
+    "TTXX": "cầu 2-2", "XXTT": "cầu 2-2 (x)",
+    "TTTXXX":"cầu 3-3", "XXXTTT":"cầu 3-3 (x)",
+    "TTTTXXXX":"cầu 4-4", "TTTTTXXXXX":"cầu 5-5",
+    "TXTXT":"cầu 5-5 (xen kẽ)", "XTXXT":"cầu 3-1-3"
   };
   return special[raw] || `cầu ${period}-cyc [${raw}]`;
 }
 
-/**
- * Hàm phát hiện tất cả cầu có thể (period 1..10)
- * Trả về danh sách sorted theo strength DESC
- */
 function detectAllCycles(arr) {
   const candidates = [];
   for (let p = 1; p <= 10; p++) {
@@ -185,38 +144,87 @@ function detectAllCycles(arr) {
       candidates.push(r);
     }
   }
-  // Sort: strength cao trước, cùng strength thì period nhỏ hơn (bệt ngắn) ưu tiên hơn
   candidates.sort((a, b) => b.strength - a.strength || a.period - b.period);
   return candidates;
 }
 
 // ════════════════════════════════════════════════════════════════
-//  CƠ CHẾ THEO VÀ BẺ CẦU — trọng tâm thuật toán
-//  CURRENT_CYCLE lưu trạng thái cầu đang theo:
-//    { cycleId, period, label, next, errCount, totalFollowed, forceBreak }
-//  Logic:
-//    - Khi phát hiện cầu mới (khác cycle cũ) -> cập nhật CURRENT_CYCLE
-//    - errCount: số lần dự đoán sai liên tiếp TRONG cầu này
-//    - Nếu errCount >= breakThreshold -> BẺ cầu (đổi chiều)
-//    - Nếu cầu không còn khớp pattern_stats -> BẺ sớm
+//  HỆ THỐNG ĐIỂM GÃY CẦU & QUYẾT ĐỊNH THEO / BẺ (NÂNG CẤP)
 // ════════════════════════════════════════════════════════════════
 
-function decideCycleAction(best, dice) {
+// Ngưỡng an toàn tối đa: sau điểm này khả năng gãy rất cao
+function getMaxSafeStreak(period) {
+  const map = {
+    1: 7,    // bệt
+    2: 10,   // 1-1
+    3: 8,    // 2-1 / 1-2
+    4: 8,    // 3-1 / 1-3
+    5: 9,
+    6: 10,
+    7: 11,
+    8: 12,
+    9: 13,
+    10: 14
+  };
+  return map[period] || Math.max(7, period * 3);
+}
+
+// Tính độ mạnh của cầu hiện tại so với quá khứ (dùng PATTERN_STATS)
+function getHistoricalConfidence(label, hits, period) {
+  const stats = PATTERN_STATS[label];
+  if (!stats || stats.total < 3) return 0; // chưa đủ dữ liệu
+  const acc = stats.correct / stats.total;
+  // Điểm thưởng nếu cầu này từng thắng nhiều, và càng gần điểm gãy thì giảm
+  let bonus = 0;
+  if (acc >= 0.75) bonus = 10;
+  else if (acc >= 0.65) bonus = 5;
+  else if (acc < 0.40) bonus = -12;
+  // Giảm dần khi gần maxSafe
+  const maxSafe = getMaxSafeStreak(period);
+  const danger = Math.max(0, hits - maxSafe + 2);
+  bonus -= danger * 3;
+  return bonus;
+}
+
+// Phát hiện nhà cái can thiệp dựa trên accuracy 20 phiên gần nhất
+function detectCasinoInterference() {
+  const checked = HISTORY.filter(h => h.checked);
+  const last20 = checked.slice(-20);
+  if (last20.length < 20) {
+    CASINO_SUSPICION = false;
+    MARKET_REGIME = "BÌNH THƯỜNG";
+    return;
+  }
+  const correct = last20.filter(h => h.dung).length;
+  RECENT_ACC_20 = correct / 20;
+  // Nếu accuracy dưới 35% và có ít nhất 20 mẫu -> nghi ngờ nhà cái đổi cầu
+  if (RECENT_ACC_20 < 0.35) {
+    CASINO_SUSPICION = true;
+    MARKET_REGIME = "CAN THIỆP";
+  } else if (RECENT_ACC_20 > 0.50) {
+    CASINO_SUSPICION = false;
+    MARKET_REGIME = "BÌNH THƯỜNG";
+  }
+}
+
+function decideCycleAction(best, dice, suspicion) {
   const p = best.period;
   const hits = best.hits;
-  // Số lần cần để "xác nhận" cầu ổn định
   const stableThreshold = p >= 4 ? p * 2 : p * 3;
   const isStable = hits >= stableThreshold;
 
-  // Độ tin cậy cơ bản
   let baseConf = 58 + Math.min(hits * 1.0, 28);
-
-  // Tăng nếu dice cùng chiều
   const diceDir = dice.bias >= 0 ? "T" : "X";
+
+  // Điều chỉnh theo lịch sử cầu
+  const histBonus = getHistoricalConfidence(best.label, hits, p);
+  baseConf += histBonus;
+
+  // Cùng chiều dice
   if (diceDir === best.next) baseConf += 7;
   else if (Math.abs(dice.bias) > 14) baseConf -= 7;
 
-  // Nếu có thống kê loại cầu này
+  // + Điểm theo PATTERN_STATS chung (đã có trong histBonus nhưng giữ lại phần này để phụ)
   const stats = PATTERN_STATS[best.label];
   if (stats && stats.total >= 4) {
     const acc = stats.correct / stats.total;
@@ -225,41 +233,60 @@ function decideCycleAction(best, dice) {
     else if (acc < 0.40) baseConf -= 10;
   }
 
-  baseConf = Math.max(55, Math.min(91, Math.round(baseConf)));
+  baseConf = Math.max(50, Math.min(93, Math.round(baseConf)));
 
-  // Quyết định THEO hay BẺ
   let action = "THEO";
   let predictedNext = best.next;
 
-  // BẺ khi: cầu chưa ổn định + dice mạnh ngược chiều + volatile
-  if (!isStable && dice.volatile && Math.abs(dice.bias) > 16 && diceDir !== best.next) {
+  // ─── ĐIỂM GÃY THÔNG MINH ──────────────────────────────────────
+  const maxSafe = getMaxSafeStreak(p);
+  const dangerLevel = hits - maxSafe; // âm = an toàn, 0 = nguy hiểm, dương = cực kỳ nguy hiểm
+
+  // 1. Bẻ khi vượt ngưỡng an toàn
+  if (dangerLevel >= 0) {
+    action = "BẺ";
+    predictedNext = opp(best.next);
+    baseConf = Math.max(62, baseConf + 5 + dangerLevel * 2); // càng vượt xa càng tự tin bẻ
+  }
+  // 2. Bẻ khi bệt dài >=7 (đã bao gồm trong trên nhưng nhấn mạnh)
+  else if (p === 1 && hits >= 7) {
+    action = "BẺ";
+    predictedNext = opp(best.next);
+    baseConf = Math.max(65, baseConf + 5);
+  }
+  // 3. Bẻ khi cầu 1-1 dài >=10
+  else if (p === 2 && hits >= 10) {
+    action = "BẺ";
+    predictedNext = opp(best.next);
+    baseConf = Math.max(65, baseConf);
+  }
+  // 4. Bẻ sớm nếu cầu chưa ổn định nhưng dice cực mạnh ngược chiều + volatile
+  else if (!isStable && dice.volatile && Math.abs(dice.bias) > 16 && diceDir !== best.next) {
     action = "BẺ";
     predictedNext = opp(best.next);
     baseConf = Math.max(57, baseConf - 5);
   }
 
-  // BẺ khi: cầu ngắn (p=1 bệt) dài >= 7 -> khả năng gãy cao
-  if (p === 1 && hits >= 7) {
-    action = "BẺ";
-    predictedNext = opp(best.next);
-    baseConf = Math.max(60, baseConf + 3);
-  }
-  // BẺ khi: cầu 1-1 dài >= 10
-  if (p === 2 && hits >= 10) {
-    action = "BẺ";
-    predictedNext = opp(best.next);
-    baseConf = Math.max(60, baseConf);
+  // ── PHÁT HIỆN NHÀ CÁI CAN THIỆP ─────────────────────────────
+  if (suspicion) {
+    // Khi nghi ngờ nhà cái can thiệp, giảm tin cậy, ưu tiên bẻ nếu đang theo
+    baseConf = Math.max(52, baseConf - 8);
+    if (action === "THEO" && dangerLevel >= -1) {
+      // Nếu cầu sắp đến điểm gãy, chuyển sang bẻ luôn
+      action = "BẺ";
+      predictedNext = opp(best.next);
+    }
   }
 
-  // Nếu CURRENT_CYCLE đang theo dõi cùng cầu (period + label khớp) -> xét errCount
+  // ── CẬP NHẬT CURRENT_CYCLE ──────────────────────────────────
+  // (Phần cập nhật errCount và totalFollowed sẽ làm trong verifyHistory)
+  // Ở đây chỉ quyết định hành động dựa trên CURRENT_CYCLE
   if (CURRENT_CYCLE && CURRENT_CYCLE.period === p && CURRENT_CYCLE.label === best.label) {
     if (CURRENT_CYCLE.errCount >= 2) {
-      // Cầu gãy -> BẺ
       action = "BẺ";
       predictedNext = opp(best.next);
       baseConf = Math.max(58, baseConf - 3);
     } else if (CURRENT_CYCLE.errCount === 1 && !isStable) {
-      // Cầu bắt đầu lung lay -> thận trọng
       action = "BẺ?";
       baseConf = Math.max(55, baseConf - 5);
     }
@@ -269,7 +296,7 @@ function decideCycleAction(best, dice) {
 }
 
 // ════════════════════════════════════════════════════════════════
-//  DỰ ĐOÁN TỔNG HỢP (VIP v7)
+//  DỰ ĐOÁN TỔNG HỢP (VIP v8)
 // ════════════════════════════════════════════════════════════════
 function finalPredict(data) {
   if (data.length < 4) {
@@ -284,6 +311,9 @@ function finalPredict(data) {
   const arr  = toArr(data);
   const dice = diceAnalysis(data);
 
+  // Cập nhật phát hiện nhà cái
+  detectCasinoInterference();
+
   // 1. Phát hiện tất cả cầu
   const allCycles = detectAllCycles(arr);
 
@@ -295,23 +325,25 @@ function finalPredict(data) {
   };
 
   if (allCycles.length > 0) {
-    // Lấy cầu tốt nhất
     const best = allCycles[0];
 
-    // Cập nhật CURRENT_CYCLE
+    // Cập nhật CURRENT_CYCLE với hits mới nhất
     if (!CURRENT_CYCLE || CURRENT_CYCLE.period !== best.period || CURRENT_CYCLE.label !== best.label) {
-      // Phát hiện cầu mới
       CYCLE_ID++;
       CURRENT_CYCLE = {
         cycleId: CYCLE_ID,
         period: best.period,
         label: best.label,
+        hits: best.hits,
         errCount: 0,
         totalFollowed: 0
       };
+    } else {
+      // Cập nhật hits hiện tại (có thể giảm nếu cầu yếu đi)
+      CURRENT_CYCLE.hits = best.hits;
     }
 
-    const decision = decideCycleAction(best, dice);
+    const decision = decideCycleAction(best, dice, CASINO_SUSPICION);
 
     chosen = {
       next: decision.next,
@@ -325,15 +357,13 @@ function finalPredict(data) {
     const diceDir = dice.bias >= 0 ? "T" : "X";
 
     if (streak.len >= 6) {
-      // Bệt cực dài -> khả năng gãy cao
       chosen = {
-        next: opp(streak.val), confidence: 70,
+        next: opp(streak.val), confidence: 72,
         label: `bệt ${streak.len} (bẻ mạnh)`, action: "BẺ", type: "streak-long"
       };
     } else if (streak.len >= 4) {
-      // Bệt dài vừa -> theo nếu dice cùng chiều, bẻ nếu dice ngược
       if (diceDir !== streak.val && Math.abs(dice.bias) > 10) {
-        chosen = { next: opp(streak.val), confidence: 65, label: `bệt ${streak.len} (bẻ dice)`, action: "BẺ", type: "streak-med" };
+        chosen = { next: opp(streak.val), confidence: 67, label: `bệt ${streak.len} (bẻ dice)`, action: "BẺ", type: "streak-med" };
       } else {
         chosen = { next: streak.val, confidence: 63, label: `bệt ${streak.len} (theo)`, action: "THEO", type: "streak-med" };
       }
@@ -343,7 +373,6 @@ function finalPredict(data) {
         label: `bệt ngắn ${streak.len} (theo)`, action: "THEO", type: "streak-short"
       };
     } else {
-      // Pure dice
       const conf = Math.min(62, 46 + Math.abs(dice.bias) * 0.5);
       chosen = {
         next: diceDir, confidence: Math.round(conf),
@@ -352,12 +381,7 @@ function finalPredict(data) {
     }
   }
 
-  // 3. Cập nhật CURRENT_CYCLE errCount từ LAST_PREDICTION
-  if (LAST_PREDICTION && CURRENT_CYCLE && LAST_PREDICTION.cycle_id === CURRENT_CYCLE.cycleId) {
-    CURRENT_CYCLE.totalFollowed++;
-  }
-
-  // 4. Chống lật dự đoán liên tục (anti-flip)
+  // 3. Anti-flip
   if (LAST_PREDICTION &&
       LAST_PREDICTION.side !== chosen.next &&
       !["BẺ", "BẺ?"].includes(chosen.action) &&
@@ -368,20 +392,26 @@ function finalPredict(data) {
     chosen.label += " (ổn định)";
   }
 
-  // 5. Điều chỉnh confidence bởi CONSECUTIVE_ERRORS tổng thể
+  // 4. Điều chỉnh do lỗi liên tiếp tổng thể
   if (CONSECUTIVE_ERRORS >= 3) {
     chosen.confidence = Math.max(52, chosen.confidence - 6);
     chosen.label += " ⚠️ thận trọng";
   }
 
-  // 6. Lưu LAST_PREDICTION
+  // 5. Lưu LAST_PREDICTION
   LAST_PREDICTION = {
     side: chosen.next, confidence: chosen.confidence,
     type: chosen.type, cycle_id: CURRENT_CYCLE?.cycleId || 0
   };
 
   const du_doan = chosen.next === "T" ? "tài" : "xỉu";
-  const icon    = chosen.action === "BẺ" ? "🔄" : chosen.action === "BẺ?" ? "⚠️" : "✅";
+  let icon = chosen.action === "BẺ" ? "🔄" : chosen.action === "BẺ?" ? "⚠️" : "✅";
+
+  // Gắn thêm cảnh báo nhà cái nếu có
+  if (CASINO_SUSPICION) {
+    icon += " 🕵️ NHÀ CÁI CHỈNH CẦU";
+    chosen.label += " [CANTHIỆP]";
+  }
 
   return {
     du_doan,
@@ -391,7 +421,8 @@ function finalPredict(data) {
     canh_bao: `${icon} [${chosen.action}] ${chosen.label} → ${du_doan} (${chosen.confidence}%)`,
     dice_info: dice,
     cycle_candidates: allCycles.slice(0, 5).map(c => ({ label: c.label, hits: c.hits, period: c.period, next: c.next === "T" ? "tài" : "xỉu" })),
-    streak_info: { val: arr[0] === "T" ? "tài" : "xỉu", len: detectStreak(arr).len }
+    streak_info: { val: arr[0] === "T" ? "tài" : "xỉu", len: detectStreak(arr).len },
+    casino_mode: MARKET_REGIME
   };
 }
 
@@ -412,17 +443,16 @@ function verifyHistory(parsed) {
     h.xuc_thuc   = real.xuc_xac;
     h.dung       = h.du_doan === real.ket_qua;
 
-    // Pattern stats
     const type = h.pattern_type || "other";
     if (!PATTERN_STATS[type]) PATTERN_STATS[type] = { total: 0, correct: 0 };
     PATTERN_STATS[type].total++;
     if (h.dung) { PATTERN_STATS[type].correct++; CONSECUTIVE_ERRORS = 0; }
     else CONSECUTIVE_ERRORS++;
 
-    // Cập nhật errCount cho CURRENT_CYCLE nếu cycle_id khớp
+    // Cập nhật errCount của CURRENT_CYCLE nếu khớp cycle_id
     if (CURRENT_CYCLE && h.cycle_id === CURRENT_CYCLE.cycleId) {
       if (!h.dung) CURRENT_CYCLE.errCount++;
-      else         CURRENT_CYCLE.errCount = 0; // reset khi đúng lại
+      else CURRENT_CYCLE.errCount = Math.max(0, CURRENT_CYCLE.errCount - 1); // giảm nhẹ khi đúng
     }
   }
   if (HISTORY.length > 500) HISTORY = HISTORY.slice(-500);
@@ -448,7 +478,7 @@ async function updateData() {
     if (!Array.isArray(sessions) || !sessions.length) return;
 
     sessions.sort((a, b) => b.id - a.id);
-    sessions = sessions.slice(0, 80); // lấy nhiều hơn để cầu dài nhận dạng chính xác
+    sessions = sessions.slice(0, 80);
 
     const parsed = sessions.map(item => {
       const d = item.dices || [1, 1, 1];
@@ -482,16 +512,15 @@ async function updateData() {
       });
     }
 
-    // Kết quả gần nhất đã kiểm chứng
     const lastV = [...HISTORY].reverse().find(h => h.checked);
     const ket_qua_gan_nhat = lastV ? {
-      phien:    lastV.phien_thuc_hien,
-      du_doan:  lastV.du_doan,
-      thuc_te:  lastV.thuc_te,
-      xuc_xac:  lastV.xuc_thuc,
+      phien:     lastV.phien_thuc_hien,
+      du_doan:   lastV.du_doan,
+      thuc_te:   lastV.thuc_te,
+      xuc_xac:   lastV.xuc_thuc,
       hanh_dong: lastV.hanh_dong,
-      dung:     lastV.dung,
-      icon:     lastV.dung ? "✅" : "❌"
+      dung:      lastV.dung,
+      icon:      lastV.dung ? "✅" : "❌"
     } : null;
 
     const s10 = parsed.slice(0, 10);
@@ -518,18 +547,20 @@ async function updateData() {
         id:     CURRENT_CYCLE.cycleId,
         label:  CURRENT_CYCLE.label,
         period: CURRENT_CYCLE.period,
+        hits:   CURRENT_CYCLE.hits,
         errCount: CURRENT_CYCLE.errCount,
         totalFollowed: CURRENT_CYCLE.totalFollowed
       } : null,
       dice_debug:    pred.dice_info,
       pattern_stats: PATTERN_STATS,
+      casino_mode:   MARKET_REGIME,
       cap_nhat:      new Date().toLocaleTimeString("vi-VN")
     };
 
     console.log(
       `[${CACHE.cap_nhat}] #${latestP} | ${pred.loai_cau} | ${pred.hanh_dong} → ${pred.du_doan}` +
       ` (${pred.do_tin_cay}%) | Acc: ${CACHE.do_chinh_xac} | Acc20: ${CACHE.recent_accuracy}` +
-      ` | ErrStreak: ${CONSECUTIVE_ERRORS}`
+      ` | Err:${CONSECUTIVE_ERRORS} | Regime:${MARKET_REGIME}`
     );
   } catch (err) {
     console.error("Lỗi API:", err.message);
@@ -537,7 +568,7 @@ async function updateData() {
 }
 
 // ════════════════════════════════════════════════════════════════
-//  ENDPOINTS
+//  ENDPOINTS (giữ nguyên, thêm một trường casino_mode vào stats)
 // ════════════════════════════════════════════════════════════════
 app.get("/",        (req, res) => res.json(CACHE));
 app.get("/predict", (req, res) => res.json({ status: "success", data: CACHE }));
@@ -559,31 +590,32 @@ app.get("/stats", (req, res) => {
     accuracy_50:     calcAccuracy(50),
     by_pattern:      PATTERN_STATS,
     consecutive_errors: CONSECUTIVE_ERRORS,
-    current_cycle:   CURRENT_CYCLE
+    current_cycle:   CURRENT_CYCLE,
+    casino_mode:     MARKET_REGIME
   });
 });
 
 app.get("/cycles", (req, res) => {
-  // Trả về top ứng viên cầu hiện tại (debug)
   res.json({
     status: "success",
     current_cycle: CURRENT_CYCLE,
     cau_dang_chay: CACHE.cau_dang_chay,
-    cycle_candidates: CACHE.cycle_candidates
+    cycle_candidates: CACHE.cycle_candidates,
+    casino_mode: MARKET_REGIME
   });
 });
 
 app.get("/algorithms", (req, res) => res.json({
-  status:  "success",
-  version: "v7-VIP",
-  method:  [
-    "1. Nhận dạng toàn bộ cầu chu kỳ (bệt/1-1/1-2/2-1/2-2/3-1/1-3/3-3/4-4/5-5/3-1-3...) từ lịch sử 80 phiên",
-    "2. Bắt cầu nhanh (chỉ cần 2 chu kỳ liên tiếp xác nhận)",
-    "3. Theo cầu: ưu tiên cầu mạnh nhất, tăng confidence khi dice đồng thuận",
-    "4. Bẻ cầu thông minh: tự động bẻ khi bệt quá dài (>=7), cầu 1-1 quá dài (>=10), dice cực mạnh ngược chiều, hoặc 2 lần sai liên tiếp trong cầu",
-    "5. Anti-flip: không lật dự đoán liên tục khi không đủ tự tin",
-    "6. CURRENT_CYCLE tracker: theo dõi errCount từng cầu riêng biệt",
-    "7. Pattern stats: điều chỉnh confidence theo hiệu suất lịch sử từng loại cầu"
+  status: "success",
+  version: "v8-VIP-Pro-Max",
+  features: [
+    "1. Nhận dạng toàn bộ cầu chu kỳ (1..10), bắt chỉ cần 2 chu kỳ",
+    "2. Điểm gãy cầu thông minh: ngưỡng an toàn riêng cho từng loại, bẻ sớm khi vượt ngưỡng",
+    "3. Theo cầu: tăng confidence khi cầu ổn định + dice đồng thuận, lịch sử tốt",
+    "4. Bẻ cầu: tự động khi chạm ngưỡng, khi dice cực mạnh trái chiều, khi nhà cái nghi can thiệp",
+    "5. Phát hiện nhà cái chỉnh cầu: nếu accuracy 20 phiên gần nhất < 35% -> cảnh báo, giảm confidence, ưu tiên bẻ",
+    "6. Anti-flip, theo dõi errCount từng cầu, điều chỉnh theo PATTERN_STATS",
+    "7. Cập nhật liên tục mỗi 5s, hiển thị trạng thái thị trường (BÌNH THƯỜNG / CAN THIỆP)"
   ]
 }));
 
@@ -591,5 +623,5 @@ app.get("/algorithms", (req, res) => res.json({
 updateData();
 setInterval(updateData, 5000);
 app.listen(PORT, () => {
-  console.log(`\n🎲 Tài Xỉu AI v7 (VIP Pro Pattern Engine) — cổng ${PORT}\n`);
+  console.log(`\n🎲 Tài Xỉu AI v8 (VIP Pro Max Engine) — cổng ${PORT}\n`);
 });
